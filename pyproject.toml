@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "human2humanoid-hoi"
+version = "0.1.0"
+description = "Whole-body humanoid imitation of human-object interaction from motion capture and monocular video"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = ["numpy", "pandas", "pyarrow", "scipy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["third_party"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
