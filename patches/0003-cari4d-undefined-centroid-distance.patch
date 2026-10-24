@@ -1,0 +1,15 @@
+diff --git a/reconstruction/modules/v2d_cari4d/lib/cari4d/prep/run_foundationpose_mhr_export.py b/reconstruction/modules/v2d_cari4d/lib/cari4d/prep/run_foundationpose_mhr_export.py
+index b0bb8712..6e852e73 100644
+--- a/reconstruction/modules/v2d_cari4d/lib/cari4d/prep/run_foundationpose_mhr_export.py
++++ b/reconstruction/modules/v2d_cari4d/lib/cari4d/prep/run_foundationpose_mhr_export.py
+@@ -560,7 +560,9 @@ def run_foundationpose_mhr_export(
+         selection_diagnostics["fp_full_image_iou"].append(float(metric_values["iou"]))
+         selection_diagnostics["fp_tolerant_precision"].append(float(metric_values["precision"]))
+         selection_diagnostics["fp_tolerant_recall"].append(float(metric_values["recall"]))
+-        selection_diagnostics["fp_centroid_distance"].append(float(metric_values["centroid_distance"]))
++        # An empty observed or rendered silhouette leaves the distance undefined (inf in pose selection); record NaN.
++        centroid_distance = float(metric_values["centroid_distance"])
++        selection_diagnostics["fp_centroid_distance"].append(centroid_distance if np.isfinite(centroid_distance) else float("nan"))
+         selection_diagnostics["fp_confirmation_count"].append(int(confirmation_count))
+         selection_diagnostics["fp_rejection_mask"].append(int(rejection_mask))
+         selection_diagnostics["fp_reliable"].append(bool(reliable_frame))

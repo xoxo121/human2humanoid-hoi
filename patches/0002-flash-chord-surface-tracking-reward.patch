@@ -1,0 +1,237 @@
+diff --git a/robotic_grounding/flash_chord/src/flash_chord/objectives/recon_body.py b/robotic_grounding/flash_chord/src/flash_chord/objectives/recon_body.py
+index cb92a9a3..630847b0 100644
+--- a/robotic_grounding/flash_chord/src/flash_chord/objectives/recon_body.py
++++ b/robotic_grounding/flash_chord/src/flash_chord/objectives/recon_body.py
+@@ -40,6 +40,14 @@ RECON_BODY_OBJECTIVE_TERM_NAMES = (
+ _RECON_BODY_OBJECTIVE_TERM_COUNT = wp.constant(12)
+ 
+ 
++def object_vertex_moments(mesh_path: str) -> tuple[np.ndarray, np.ndarray]:
++    """Mean and second moment E[v v^T] of an object mesh's vertices in its body frame (the ADD vertex set)."""
++    import trimesh
++
++    vertices = np.asarray(trimesh.load(mesh_path, force="mesh").vertices, dtype=np.float64)
++    return vertices.mean(axis=0), vertices.T @ vertices / len(vertices)
++
++
+ @dataclass(frozen=True)
+ class ReconBodyObjectiveConfig:
+     """Exact BodyRecon weights, shaping scales, and wrench approximation."""
+@@ -65,6 +73,11 @@ class ReconBodyObjectiveConfig:
+     # Optional object-orientation shaping: when set, the object term becomes a pose reward
+     # exp(-|dp|^2 / object_position_std^2) * exp(-angle^2 / object_orientation_std^2).
+     object_orientation_std: float | None = None
++    # Optional metric-aligned object term: when set, the object term becomes a smooth ADD-AUC surrogate,
++    # mean_k sigmoid((k cm - d) / softness) for k = 1..9, where d is the RMS distance between corresponding
++    # object-mesh vertices under the live and target poses (computed in closed form from the vertex moments).
++    # It replaces the position/orientation object reward, so both object stds are then unused.
++    object_surface_auc_softness: float | None = None
+     soft_joint_limit_factor: float = 0.9
+     force_closure_min_support: float = 0.01
+     num_wrench_basis: int = 512
+@@ -104,6 +117,10 @@ class ReconBodyObjectiveConfig:
+             math.isfinite(self.object_orientation_std) and self.object_orientation_std > 0.0
+         ):
+             raise ValueError("ReconBody object_orientation_std must be positive and finite when set")
++        if self.object_surface_auc_softness is not None and not (
++            math.isfinite(self.object_surface_auc_softness) and self.object_surface_auc_softness > 0.0
++        ):
++            raise ValueError("ReconBody object_surface_auc_softness must be positive and finite when set")
+         if self.force_closure_min_support < 0.0 or self.friction_coefficient < 0.0:
+             raise ValueError("ReconBody wrench thresholds must be non-negative")
+         if self.num_wrench_basis <= 0 or self.num_friction_cone_edges <= 0:
+@@ -229,6 +246,10 @@ def compose_recon_body_objective(
+     palm_position_std: float,
+     palm_orientation_std: float,
+     object_orientation_std: float,
++    object_surface_mean: wp.vec3,
++    object_surface_second_moment: wp.mat33,
++    object_scale: wp.array(dtype=wp.float32),
++    object_surface_auc_softness: float,
+     weights: wp.array(dtype=wp.float32),
+     frame_dt: float,
+     terms: wp.array(dtype=wp.float32),
+@@ -293,6 +314,22 @@ def compose_recon_body_objective(
+     terms[term_base + 7] = orientation_factor * wp.exp(
+         -wp.dot(object_error, object_error) / (object_position_std * object_position_std)
+     )
++    if object_surface_auc_softness > 0.0:
++        # E|dR v + dp|^2 = |dp|^2 + 2 dp.(dR mu) + tr(dR^T dR Sigma) over vertices v with mean mu, moment Sigma.
++        scale = object_scale[world]
++        rotation_error = wp.quat_to_matrix(wp.normalize(wp.transform_get_rotation(object_xf))) - wp.quat_to_matrix(
++            wp.normalize(object_target_quat_w[world])
++        )
++        mean_square = (
++            wp.dot(object_error, object_error)
++            + 2.0 * scale * wp.dot(object_error, rotation_error * object_surface_mean)
++            + scale * scale * wp.trace(wp.transpose(rotation_error) * rotation_error * object_surface_second_moment)
++        )
++        distance = wp.sqrt(wp.max(mean_square, 0.0))
++        surrogate = float(0.0)  # noqa: UP018
++        for threshold in range(1, 10):
++            surrogate += 1.0 / (1.0 + wp.exp((distance - 0.01 * float(threshold)) / object_surface_auc_softness))
++        terms[term_base + 7] = surrogate / 9.0
+ 
+     denominator = num_frames - 1 - episode_start_frame[world]
+     progress = float(1.0)  # noqa: UP018
+@@ -355,6 +392,9 @@ class ReconBodyObjective:
+     soft_lower: wp.array
+     soft_upper: wp.array
+     contact_active: wp.array
++    object_surface_mean: wp.vec3
++    object_surface_second_moment: wp.mat33
++    object_scale: wp.array
+     wrench_basis: wp.array
+     cone_cos: wp.array
+     cone_sin: wp.array
+@@ -436,6 +476,9 @@ class ReconBodyObjective:
+             axis=0,
+         )
+         cone_cos, cone_sin = friction_cone_angles(config.num_friction_cone_edges)
++        surface_mean, surface_second_moment = np.zeros(3), np.zeros((3, 3))
++        if config.object_surface_auc_softness is not None:
++            surface_mean, surface_second_moment = object_vertex_moments(reference.object_mesh_paths()[0])
+         support_size = world_count * len(config.sides) * command.layout.num_bodies * config.num_wrench_basis
+         return cls(
+             config=config,
+@@ -462,6 +505,13 @@ class ReconBodyObjective:
+             soft_lower=wp.array(center - half, dtype=wp.float32, device=device),
+             soft_upper=wp.array(center + half, dtype=wp.float32, device=device),
+             contact_active=wp.array(labels.reshape(-1), dtype=wp.float32, device=device),
++            object_surface_mean=wp.vec3(*surface_mean),
++            object_surface_second_moment=wp.mat33(*surface_second_moment.reshape(-1)),
++            object_scale=wp.array(
++                np.asarray(command.object_scales.numpy(), dtype=np.float32).reshape(world_count, -1)[:, 0],
++                dtype=wp.float32,
++                device=device,
++            ),
+             wrench_basis=wp.array(basis, dtype=wp.spatial_vector, device=device),
+             cone_cos=wp.array(cone_cos, dtype=wp.float32, device=device),
+             cone_sin=wp.array(cone_sin, dtype=wp.float32, device=device),
+@@ -571,6 +621,10 @@ class ReconBodyObjective:
+                 self.config.palm_position_std,
+                 self.config.palm_orientation_std,
+                 self.config.object_orientation_std or 0.0,
++                self.object_surface_mean,
++                self.object_surface_second_moment,
++                self.object_scale,
++                self.config.object_surface_auc_softness or 0.0,
+                 self.weights,
+                 self.frame_dt,
+             ],
+diff --git a/robotic_grounding/flash_chord/tests/objectives/test_recon_body_objective.py b/robotic_grounding/flash_chord/tests/objectives/test_recon_body_objective.py
+index 4be863f4..15d4dddf 100644
+--- a/robotic_grounding/flash_chord/tests/objectives/test_recon_body_objective.py
++++ b/robotic_grounding/flash_chord/tests/objectives/test_recon_body_objective.py
+@@ -65,6 +65,10 @@ def test_recon_body_objective_terms_match_analytic_values():
+                 0.2,
+                 0.4,
+                 0.0,
++                wp.vec3(0.0, 0.0, 0.0),
++                wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
++                wp.ones(1, dtype=wp.float32),
++                0.0,
+                 wp.ones(12, dtype=wp.float32),
+                 0.02,
+             ],
+@@ -137,6 +141,10 @@ def test_object_orientation_std_turns_the_object_term_into_a_pose_reward():
+                     0.2,
+                     0.4,
+                     std,
++                    wp.vec3(0.0, 0.0, 0.0),
++                    wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
++                    wp.ones(1, dtype=wp.float32),
++                    0.0,
+                     wp.ones(12, dtype=wp.float32),
+                     0.02,
+                 ],
+@@ -149,6 +157,89 @@ def test_object_orientation_std_turns_the_object_term_into_a_pose_reward():
+     np.testing.assert_allclose(terms[0.5], position_factor * np.exp(-((0.5 * np.pi) ** 2) / 0.5**2), rtol=1.0e-4)
+ 
+ 
++def test_object_surface_auc_softness_scores_vertex_distance_like_the_add_metric():
++    import warp as wp
++
++    from flash_chord.objectives.recon_body import compose_recon_body_objective
++
++    # Two vertices at +-10 cm on x; live pose is offset 2 cm in y and turned 10 degrees about z.
++    vertices = np.asarray([[0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]])
++    angle = np.radians(10.0)
++    rotation = np.asarray([[np.cos(angle), -np.sin(angle), 0.0], [np.sin(angle), np.cos(angle), 0.0], [0.0, 0.0, 1.0]])
++    offset = np.asarray([0.0, 0.02, 0.0])
++    distance = np.sqrt(np.mean(np.sum((vertices @ rotation.T + offset - vertices) ** 2, axis=1)))
++    softness = 0.005
++    expected = np.mean([1.0 / (1.0 + np.exp((distance - 0.01 * k) / softness)) for k in range(1, 10)])
++
++    reference_joint_q = np.zeros((11, 10), dtype=np.float32)
++    reference_joint_q[:, 6] = 1.0
++    wrist_quat = np.zeros((22, 4), dtype=np.float32)
++    wrist_quat[:, 3] = 1.0
++    second_moment = vertices.T @ vertices / len(vertices)
++    with wp.ScopedDevice("cpu"):
++        out = wp.zeros(12, dtype=wp.float32)
++        wp.launch(
++            compose_recon_body_objective,
++            dim=1,
++            inputs=[
++                wp.array(
++                    [
++                        wp.transform_identity(),
++                        wp.transform(wp.vec3(1.0, 0.0, 0.0), wp.quat_identity()),
++                        wp.transform(wp.vec3(0.0, 1.0, 0.0), wp.quat_identity()),
++                        wp.transform(
++                            wp.vec3(2.0, 0.02, 0.0), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(angle))
++                        ),
++                    ],
++                    dtype=wp.transform,
++                ),
++                wp.zeros(10, dtype=wp.float32),
++                wp.array([5], dtype=wp.int32),
++                wp.zeros(1, dtype=wp.int32),
++                wp.zeros(1, dtype=wp.int32),
++                wp.zeros(1, dtype=wp.float32),
++                wp.zeros(1, dtype=wp.float32),
++                wp.zeros(1, dtype=wp.float32),
++                wp.zeros(10, dtype=wp.float32),
++                wp.array(reference_joint_q, dtype=wp.float32),
++                wp.zeros(22, dtype=wp.vec3),
++                wp.array(wrist_quat, dtype=wp.quat),
++                wp.array([1, 2], dtype=wp.int32),
++                wp.zeros(2, dtype=wp.vec3),
++                wp.array([wp.quat_identity(), wp.quat_identity()], dtype=wp.quat),
++                wp.array([7, 8], dtype=wp.int32),
++                wp.array([7], dtype=wp.int32),
++                wp.array([-1.0, -1.0], dtype=wp.float32),
++                wp.array([1.0, 1.0], dtype=wp.float32),
++                3,
++                wp.array([[2.0, 0.0, 0.0]], dtype=wp.vec3),
++                wp.array([wp.quat_identity()], dtype=wp.quat),
++                0,
++                11,
++                4,
++                10,
++                2,
++                1,
++                0.3,
++                0.4,
++                1.0,
++                0.2,
++                0.2,
++                0.4,
++                0.5,
++                wp.vec3(*vertices.mean(axis=0)),
++                wp.mat33(*second_moment.reshape(-1)),
++                wp.ones(1, dtype=wp.float32),
++                softness,
++                wp.ones(12, dtype=wp.float32),
++                0.02,
++            ],
++            outputs=[out, wp.zeros(1, dtype=wp.float32)],
++        )
++
++    np.testing.assert_allclose(out.numpy()[7], expected, rtol=1.0e-4)
++
++
+ def test_force_closure_uses_binary_labels_and_maximum_support_across_bodies():
+     import warp as wp
+ 
